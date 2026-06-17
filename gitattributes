@@ -1,0 +1,25 @@
+# Normalize line endings: stored as LF in the repo, checked out native.
+* text=auto
+
+# Shell scripts MUST stay LF or they break on macOS/Linux.
+*.sh    text eol=lf
+
+# Windows batch files want CRLF.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Source / config: normalized text.
+*.cpp   text
+*.h     text
+*.hpp   text
+*.py    text
+*.txt   text
+*.md    text
+*.blink text
+
+# Compiled artifacts: binary (belt-and-braces; normally gitignored anyway).
+*.dll   binary
+*.dylib binary
+*.so    binary
+*.lib   binary
+*.obj   binary

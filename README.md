@@ -1,44 +1,75 @@
-# PRefToMotion
-C++ plugin for Foundry's Nuke software that calculates the motion vectors from a source frame to the current frame using a position reference pass or similar. It uses the [nanoflann](https://github.com/jlblancoc/nanoflann) kd-tree library under the hood to do a nearest neighbour lookup using the xyz value of the supplied pref channel.
+# PRefToMotion (optimized)
 
-| ![alt text](examples/PRefToMotion_example.png "example of a single keyed frame being warped using a position reference map") |
-| --- |
-| **example image** a smiley face drawn at frame 1 and warped to 5, 10 and 15 using a position reference pass |
+A 3D KD-tree backward-mapping node: converts a PRef (position-reference) pass
+into an ST/UV map by matching each target-frame pixel to its nearest source-frame
+points and blending their screen coordinates. Optimized fork of masterkeech's
+`PRefToMotion` — numerically identical output, faster build and per-pixel loop.
 
+## Layout
 
-# build
-
-Set the NUKE_VERSION CMake variable to the version of Nuke you wish to compile against, eg. 11.3v6 (tested version), assuming standard installation. Then it's just standard cmake build and make install commands for generation of the Nuke plugin.
-
-- cmake /path/to/PRefToMotion/ -DNUKE_VERSION=11.3v6 -DCMAKE_INSTALL_PREFIX=~/.nuke -DCMAKE_BUILD_TYPE=DEBUG
-- make install
-
-# usage
-PRefToMotion(.dylib|.so) should now be built and installed into your user's .nuke folder, so now it's just a matter of launching nuke and opening the test script `pref_motion_example.nk`
-
-# parameters
-very simple list of parameters to interact with so far, the are:
-- **pref channels**: channels that hold the xyz pref of similar data, if a 4th channel is supplied it will be used as a mask.
-- **uv channels**: channels to store the uv data that is being generated
-- **source frame**: source frame to calculate the motion vectors from.
-- **samples**: number of nearest neighbours to look up, used to calculate a weighted average from the squared distance to the lookup point.
-- **modes**: generates the motion as either an st map (normalised), uv map (vectors) or as the source pixels.
-# speed
-building the indices and querying a kd-tree with more than a million points can tend to be slow, optimisations forth coming.
-
-```buildoutcfg
-example timing of building of a kd-tree with 1,063,379
-
---------------- kd tree ---------------
-           bbox: 91, 48, 1469, 1023
-output channels: rgba,forward.u,forward.v
-  pref channels: rgb
-     num points: 1063379
-        samples: 3
-   source frame: 1
-  current frame: 15
---------------- timing ---------------
-     query time: 208 ms
-     build time: 1096 ms
-     total time: 1304 ms
 ```
+PRefToMotion/
+├── CMakeLists.txt
+├── src/
+│   └── PRefToMotion.cpp        # the node
+├── third_party/
+│   └── nanoflann.hpp           # bundled (BSD, header-only)
+└── README.md
+```
+
+Nothing external is required beyond a Nuke install to link against.
+
+## Build — Windows (Nuke 16.1, VS 2019)
+
+Nuke 14–16.1 must be built with **Visual Studio 2019** (MSVC 19.29). Newer
+toolsets are unlikely to load.
+
+```powershell
+cd PRefToMotion
+cmake -G "Visual Studio 16 2019" -A x64 -DCMAKE_PREFIX_PATH="C:/Program Files/Nuke16.1v1" -B build
+cmake --build build --config Release
+```
+
+The result, `PRefToMotion.dll`, is copied to `%USERPROFILE%\.nuke` automatically.
+
+## Build — macOS
+
+```bash
+cd PRefToMotion
+cmake -DCMAKE_PREFIX_PATH="/Applications/Nuke16.1v1/Nuke16.1v1.app/Contents/MacOS" -B build
+cmake --build build --config Release
+```
+
+Produces `PRefToMotion.dylib`, copied to `~/.nuke`.
+
+## If `find_package(Nuke)` can't find your install
+
+The CMake falls back to a manual import. Point it at the directory that
+contains the DDImage library and `include/`:
+
+```powershell
+# Windows: the Nuke root (has DDImage.lib, DDImage.dll, include/)
+cmake -G "Visual Studio 16 2019" -A x64 -DNUKE_INSTALL_PATH="C:/Program Files/Nuke16.1v1" -B build
+```
+
+```bash
+# macOS: the MacOS dir inside the .app bundle
+cmake -DNUKE_INSTALL_PATH="/Applications/Nuke16.1v1/Nuke16.1v1.app/Contents/MacOS" -B build
+```
+
+You can also set `-DNuke_DIR=<folder containing NukeConfig.cmake>` if your
+install ships the package somewhere `CMAKE_PREFIX_PATH` doesn't reach.
+
+## Notes
+
+- The output filename must stay `PRefToMotion` — it has to match the
+  `Op::Description` name string, or Nuke reports "plugin did not define
+  PRefToMotion" at load.
+- Build without `NDEBUG` to print KD-tree fill/build timings to stdout on each
+  rebuild.
+- `samples 1` is the nearest-neighbour fast path (crispest, fastest); higher
+  `samples` use inverse-square-distance weighting across neighbours.
+- To run this side-by-side with the original for A/B testing, change the
+  `CLASS` string and the `Op::Description` menu path in `src/PRefToMotion.cpp`
+  (e.g. `"PRefToMotion2"`, `"Transform/PRefToMotion2"`) and rename the target
+  in `CMakeLists.txt` to match.

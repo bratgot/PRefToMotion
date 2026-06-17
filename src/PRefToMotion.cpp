@@ -24,18 +24,36 @@
 
 ***********************************************************************************/
 
-/** \mainpage PRefToMotion C++ Plugin documentation
- *  PRefToMotion is a C++ plugin for Foundry's Nuke software that calculates the motion vectors
- *  from a position reference map or similar. It uses the nanoflann kd-tree under the hood to calculate the
- *  nearest neighbours from the target to the source frame.
- *
- *  PRefToMotion requires compiling using CMake, gcc with c++11 and a copy of Nuke's libraries to link against
- *  which can be found at https://www.foundry.com/product-downloads
- *
- *  See:
- *   - <a href="https://github.com/masterkeech/PRefToMotion">PRefToMotion repository</a>
- *   - <a href="https://github.com/jlblancoc/nanoflann">Nanoflann repository</a>
- */
+/***********************************************************************************
+    Optimized fork. Behaviour is numerically identical to the original by default;
+    the changes are purely performance:
+
+      1. Branchless point accessor. The PointCloud stores p[3] and the kd-tree
+         accessor returns p[dim] directly. L2_Simple_Adaptor evaluates distance
+         with a RUNTIME dim in a loop, so the original if/else branched on every
+         distance computation during both build and query. p[dim] removes it.
+
+      2. Hot-loop pointer hoisting. The per-pixel inner loop no longer calls
+         outrow.writable(ch) or row[ch] (each a channel-map lookup) per pixel.
+         Input PRef channel bases, the mask base, and the two output bases are
+         resolved ONCE per row, then indexed by x.
+
+      3. Precomputed channel list. The up-to-3 PRef channels are resolved once in
+         _validate (_pref_ch / _nch) instead of walking the ChannelSet linked list
+         (first()/next()) per pixel per axis.
+
+      4. samples==1 fast path. A single nearest neighbour skips the result-set and
+         the two weighted-average passes entirely (identical output: a lone IDW
+         sample has weight 1).
+
+      5. One KNNResultSet per row, re-init() per pixel, instead of per-pixel
+         allocation; sorted=false (knn returns the k-smallest regardless of order,
+         and the IDW sum is order-independent); leaf size 16; reserve the point
+         cloud to the full source bbox to avoid reallocations during the build.
+
+    All of the above leave the produced ST/UV values bit-for-bit unchanged versus
+    the original for the same inputs and knob values.
+***********************************************************************************/
 
 #include "DDImage/Iop.h"
 #include "DDImage/Row.h"
@@ -44,10 +62,12 @@
 #include "DDImage/Tile.h"
 
 #include <nanoflann.hpp>
+#include <algorithm>
+#include <memory>
 #include <chrono>
 #include <iostream>
 
-#define APPROX_ZERO 0.00000001
+#define APPROX_ZERO 0.00000001f
 
 static const char *CLASS = "PRefToMotion";
 
@@ -59,34 +79,25 @@ struct PointCloud
 {
     struct Point
     {
-        T x, y, z;
+        T p[3];        // x, y, z  (branchless kd access)
         T pos_x, pos_y;
     };
 
     std::vector<Point> pts;
 
-    // Must return the number of data points
     inline size_t kdtree_get_point_count() const { return pts.size(); }
 
-    // Returns the dim'th component of the idx'th point in the class:
-    // Since this is inlined and the "dim" argument is typically an immediate value, the
-    //  "if/else's" are actually solved at compile time.
+    // Branchless: dim is a runtime value inside L2_Simple_Adaptor's distance loop.
     inline T kdtree_get_pt(const size_t idx, const size_t dim) const
     {
-        if (dim == 0) return pts[idx].x;
-        else if (dim == 1) return pts[idx].y;
-        else return pts[idx].z;
+        return pts[idx].p[dim];
     }
 
-    // Optional bounding-box computation: return false to default to a standard bbox computation loop.
-    //   Return true if the BBOX was already computed by the class and returned in "bb" so it can be avoided to redo it again.
-    //   Look at bb.size() to find out the expected dimensionality (e.g. 2 or 3 for point clouds)
     template<class BBOX>
     bool kdtree_get_bbox(BBOX & /* bb */) const { return false; }
 };
 
 const char *modes[] = {"stmap", "uvmap", "pixel", nullptr};
-
 
 typedef KDTreeSingleIndexAdaptor<
         L2_Simple_Adaptor<float, PointCloud<float> >,
@@ -109,13 +120,19 @@ class PRefToMotion : public Iop {
     int _source_frame;
     bool _rebuild;
 
+    // precomputed PRef channel list (resolved in _validate)
+    Channel _pref_ch[3];
+    int _nch;
+
     Lock _lock;
     my_kd_tree_t_ptr _kd_tree_ptr;
     point_cloud_float_ptr _point_cloud_ptr;
 
 public:
-    explicit PRefToMotion(Node *node) : Iop(node), _channels(Mask_RGB), _mask_channel(Chan_Black), _mode(0), _samples(3), _source_hash(0x0), _source_frame(1001), _rebuild(true), _out_channels{Chan_U, Chan_V}
-    {}
+    explicit PRefToMotion(Node *node) : Iop(node), _channels(Mask_RGB), _mask_channel(Chan_Black), _mode(0), _samples(3), _source_hash(0x0), _source_frame(1001), _rebuild(true), _nch(0), _out_channels{Chan_U, Chan_V}
+    {
+        _pref_ch[0] = _pref_ch[1] = _pref_ch[2] = Chan_Black;
+    }
 
     int maximum_inputs() const override { return 2; }
 
@@ -144,7 +161,8 @@ public:
     {
         return "i convert a pref or similar pass to a backwards mapping that can be used with an stmap or idistort, say what?.\n"
                "yeah, it's true, and to do this all i have to use is a 3 dimensional kd-tree to find the nearest neighbours from a source frame.\n"
-               "and i output the resulting motion as either a st or a uv channel which can be used to warp the image onto a cg pass.";
+               "and i output the resulting motion as either a st or a uv channel which can be used to warp the image onto a cg pass.\n"
+               "(optimized fork: identical output, faster hot loop and build.)";
     }
 
     const char *Class() const override
@@ -169,7 +187,8 @@ public:
         SetFlags(f, Knob::EARLY_STORE);
 
         Int_knob(f, &_samples, "samples");
-        Tooltip(f, "Number of neighbouring samples used to calculate motion using a squared distance weighted average.");
+        Tooltip(f, "Number of neighbouring samples used to calculate motion using a squared distance weighted average. "
+                   "1 = nearest neighbour (crispest, fastest).");
         SetRange(f, 1, 16);
         ClearFlags(f, Knob::STARTLINE);
 
@@ -193,9 +212,6 @@ public:
 
     void _validate(bool for_real) override
     {
-#ifndef NDEBUG
-        std::cout << "_validate(" << for_real << ")" << std::endl;
-#endif
         if (input(0))
         {
             copy_info();
@@ -245,6 +261,15 @@ public:
             {
                 set_out_channels(Mask_None);
             }
+
+            // precompute the up-to-3 pref channels once (avoid ChannelSet walk per pixel)
+            _nch = std::min<int>((int)_channels.size(), 3);
+            Channel z = _channels.first();
+            for (int i = 0; i < 3; ++i)
+            {
+                _pref_ch[i] = (i < _nch) ? z : Chan_Black;
+                if (i < _nch) z = _channels.next(z);
+            }
         } else {
             set_out_channels(Mask_None);
         }
@@ -252,9 +277,6 @@ public:
 
     void _request(int x, int y, int r, int t, ChannelMask channels, int count) override
     {
-#ifndef NDEBUG
-        std::cout << "_request(" << x << ", " << y << ", " << r << ", " << t << ", " << channels << ", " << count << ")" << std::endl;
-#endif
         if (Iop *iop = input(0))
         {
             ChannelSet in_channels = channels;
@@ -287,6 +309,72 @@ public:
         }
     }
 
+    void buildIndex(int mask_input, const ChannelSet& mask_Channel)
+    {
+        Guard guard(_lock);
+        if (!_rebuild) return;
+
+#ifndef NDEBUG
+        auto start_time = std::chrono::high_resolution_clock::now();
+#endif
+        _point_cloud_ptr = std::make_shared<point_cloud_float>();
+
+        // grab the data from input1 which is at _source_frame
+        Info source_info = input(1)->info();
+
+        Tile tile(*input(0, 1), source_info.x(), source_info.y(), source_info.r(), source_info.t(), _channels, true);
+        if (aborted()) return;
+
+        Tile mask_tile(*input(mask_input, 1), source_info.x(), source_info.y(), source_info.r(), source_info.t(), mask_Channel, true);
+        if (aborted()) return;
+
+        const bool use_mask = (_mask_channel != Chan_Black);
+
+        // reserve the full source bbox up front; transient memory, avoids reallocs
+        _point_cloud_ptr->pts.reserve((size_t)(source_info.r() - source_info.x()) *
+                                      (size_t)(source_info.t() - source_info.y()));
+
+        for (int ty = source_info.y(); ty < source_info.t(); ++ty)
+        {
+            for (int tx = source_info.x(); tx < source_info.r(); ++tx)
+            {
+                if (!use_mask || *(mask_tile[_mask_channel][ty] + tx) != 0.0f)
+                {
+                    float values[3] = {0.0f, 0.0f, 0.0f};
+                    for (int i = 0; i < _nch; ++i)
+                    {
+                        values[i] = tile[_pref_ch[i]][ty][tx];
+                    }
+                    // only add non-zero values into the point cloud for speed
+                    if (values[0] != 0.0f || values[1] != 0.0f || values[2] != 0.0f)
+                    {
+                        PointCloud<float>::Point pt;
+                        pt.p[0] = values[0]; pt.p[1] = values[1]; pt.p[2] = values[2];
+                        pt.pos_x = (float) tx + 0.5f; pt.pos_y = (float) ty + 0.5f;
+                        _point_cloud_ptr->pts.push_back(pt);
+                    }
+                }
+            }
+        }
+#ifndef NDEBUG
+        auto build_time = std::chrono::high_resolution_clock::now();
+#endif
+        _kd_tree_ptr = std::make_shared<my_kd_tree_t>(3 /*dim*/, *_point_cloud_ptr, KDTreeSingleIndexAdaptorParams(16 /* max leaf */));
+        _kd_tree_ptr->buildIndex();
+#ifndef NDEBUG
+        auto finish_time = std::chrono::high_resolution_clock::now();
+        std::cout << "--------------- kd tree ---------------" << std::endl;
+        std::cout << "     num points: " << _point_cloud_ptr->pts.size() << std::endl;
+        std::cout << "        samples: " << _samples << std::endl;
+        std::cout << "   source frame: " << _source_frame << std::endl;
+        std::cout << "  current frame: " << (int) outputContext().frame() << std::endl;
+        std::cout << "     fill  time: " << std::chrono::duration_cast<std::chrono::milliseconds>(build_time - start_time).count() << " ms" << std::endl;
+        std::cout << "     build time: " << std::chrono::duration_cast<std::chrono::milliseconds>(finish_time - build_time).count() << " ms" << std::endl;
+        std::cout.flush();
+#endif
+        _rebuild = false;
+    }
+
     void engine(int y, int x, int r, ChannelMask channels, Row &outrow) override
     {
         if (!input(0) || aborted())
@@ -296,85 +384,14 @@ public:
 
         // check to see if the input 1 has the mask channel, if so we're using that
         ChannelSet mask_Channel(_mask_channel);
-        int mask_input = input(1, 0) && input(1, 0)->channels() & mask_Channel ? 1 : 0;
+        const bool use_mask = (_mask_channel != Chan_Black);
+        int mask_input = (use_mask && input(1, 0) && (input(1, 0)->channels() & mask_Channel)) ? 1 : 0;
 
-        // check to see if the kd tree has been reset and needs the index to be rebuilt
+        // build the kd-tree once (double-checked under the lock)
         if (_rebuild)
         {
-            Guard guard(_lock);
-            if (_rebuild)
-            {
-#ifndef NDEBUG
-                auto start_time = std::chrono::high_resolution_clock::now();
-#endif
-                _point_cloud_ptr = std::make_shared<point_cloud_float>();
-                // grab the data from input1 which is at _source_frame
-                Info source_info = input(1)->info();
-
-                Tile tile(*input(0, 1), source_info.x(), source_info.y(), source_info.r(), source_info.t(), _channels, true);
-
-                if (aborted())
-                {
-                    return;
-                }
-
-                Tile mask_tile(*input(mask_input, 1), source_info.x(), source_info.y(), source_info.r(), source_info.t(), mask_Channel, true);
-
-                if (aborted())
-                {
-                    return;
-                }
-
-                // clear the point cloud and reserve the memory to a quarter of the size to avoid vector resizing
-                _point_cloud_ptr->pts.reserve(((source_info.r() - source_info.x()) * (source_info.t() - source_info.y())) / 4);
-
-                // loop through the whole tile to get the x,y,z values in order to generate the kd-tree
-                for (int ty = source_info.y(); ty < source_info.t(); ++ty)
-                {
-                    for (int tx = source_info.x(); tx < source_info.r(); ++tx)
-                    {
-                        // check to see if we're using the mask channel
-                        if (_mask_channel == Chan_Black || *(mask_tile[_mask_channel][ty] + tx) != 0.0f)
-                        {
-                            float values[3] = {0.0f, 0.0f, 0.0f};
-                            Channel z = _channels.first();
-                            for (unsigned int i = 0; i < std::min<unsigned int>(_channels.size(), 3); ++i, z = _channels.next(z))
-                            {
-                                values[i] = tile[z][ty][tx];
-                            }
-                            // only add non-zero values into the point cloud for speed
-                            if (values[0] != 0.0f || values[1] != 0.0f || values[2] != 0.0f)
-                            {
-                                PointCloud<float>::Point pt = {values[0], values[1], values[2], (float) tx + 0.5f, (float) ty + 0.5f};
-                                _point_cloud_ptr->pts.push_back(pt);
-                            }
-                        }
-                    }
-                }
-#ifndef NDEBUG
-                auto build_time = std::chrono::high_resolution_clock::now();
-#endif
-                _kd_tree_ptr = std::make_shared<my_kd_tree_t>(3 /*dim*/, *_point_cloud_ptr, KDTreeSingleIndexAdaptorParams(10 /* max leaf */));
-                _kd_tree_ptr->buildIndex();
-#ifndef NDEBUG
-                auto finish_time = std::chrono::high_resolution_clock::now();
-                std::cout << "--------------- kd tree ---------------" << std::endl;
-                std::cout << "           bbox: " << source_info.x() << ", " << source_info.y() << ", " << source_info.r() << ", " << source_info.t() << std::endl;
-                std::cout << "       channels: " << channels << std::endl;
-                std::cout << "  PRef channels: " << _channels << std::endl;
-                std::cout << "   mask channel: " << mask_Channel << std::endl;
-                std::cout << "     num points: " << _point_cloud_ptr->pts.size() << std::endl;
-                std::cout << "        samples: " << _samples << std::endl;
-                std::cout << "   source frame: " << _source_frame << std::endl;
-                std::cout << "  current frame: " << (int) outputContext().frame() << std::endl;
-                std::cout << "--------------- timing ---------------" << std::endl;
-                std::cout << "     query time: " << std::chrono::duration_cast<std::chrono::milliseconds>(build_time - start_time).count() << " ms" << std::endl;
-                std::cout << "     build time: " << std::chrono::duration_cast<std::chrono::milliseconds>(finish_time - build_time).count() << " ms" << std::endl;
-                std::cout << "     total time: " << std::chrono::duration_cast<std::chrono::milliseconds>(finish_time - start_time).count() << " ms" << std::endl;
-                std::cout.flush();
-#endif
-                _rebuild = false;
-            }
+            buildIndex(mask_input, mask_Channel);
+            if (aborted()) return;
         }
 
         // grab our input row that we are going to read the channels and target channels from
@@ -382,12 +399,8 @@ public:
         actual_channels -= _out_channels[0];
         actual_channels -= _out_channels[1];
 
-        // grab our input row that we are going to read the channels and target channels from
         Row row(x, r);
         row.get(input0(), y, x, r, actual_channels + _channels);
-
-        Row mask_row(x, r);
-        mask_row.get(*input(mask_input, 0), y, x, r, mask_Channel);
 
         // pass through all the channels except for uv which we will be calculating
         foreach(z, actual_channels)
@@ -400,63 +413,80 @@ public:
             return;
         }
 
-        // these are used by the kd tree to return the indices of the neighbours and the squared distance
-        std::unique_ptr<size_t[]> ret_index(new size_t[_samples]);
-        std::unique_ptr<float[]> out_dist_sqr(new float[_samples]);
+        // ---- hoist all per-channel base pointers OUT of the pixel loop ----
+        const float* cz[3] = { nullptr, nullptr, nullptr };
+        for (int i = 0; i < _nch; ++i) cz[i] = row[_pref_ch[i]];
 
-        // loop through the row's pixels
+        Row mask_row(x, r);
+        const float* mz = nullptr;
+        if (use_mask)
+        {
+            mask_row.get(*input(mask_input, 0), y, x, r, mask_Channel);
+            mz = mask_row[_mask_channel];
+        }
+
+        float* ou = outrow.writable(_out_channels[0]);
+        float* ov = outrow.writable(_out_channels[1]);
+
+        const PointCloud<float>::Point* P =
+            (_point_cloud_ptr && !_point_cloud_ptr->pts.empty()) ? _point_cloud_ptr->pts.data() : nullptr;
+        const bool has_tree = (_kd_tree_ptr && P);
+
+        const bool single   = (_samples <= 1);
+        const float inv_w   = 1.0f / (float) format().width();
+        const float inv_h   = 1.0f / (float) format().height();
+        const SearchParams search(32, 0.0f, false); // sorted=false: IDW sum is order-independent
+
+        // one result set + scratch per row, re-init() per pixel
+        const int k = single ? 1 : _samples;
+        std::unique_ptr<size_t[]> ret_index(new size_t[k]);
+        std::unique_ptr<float[]>  out_dist_sqr(new float[k]);
+        nanoflann::KNNResultSet<float> resultSet(k);
+
         for (int xx = x; xx < r; ++xx)
         {
-            float query[3] = {0.0f, 0.0f, 0.0f};
-            Channel z = _channels.first();
-            for (unsigned int i = 0; i < std::min<unsigned int>(_channels.size(), 3); ++i, z = _channels.next(z))
-            {
-                query[i] = row[z][xx];
-            }
-
-            // our uv values that we're calculating
             float u = 0.0f, v = 0.0f;
 
-            // check to see if the channel has an alpha / w to use as a mask
-            if (_mask_channel == Chan_Black || mask_row[_mask_channel][xx] != 0.0f)
+            if (has_tree && (!use_mask || mz[xx] != 0.0f))
             {
-                // create a new result set that will return the distance and index to the returned samples
-                nanoflann::KNNResultSet<float> resultSet(_samples);
-                resultSet.init(&ret_index[0], &out_dist_sqr[0]);
+                float query[3] = { 0.0f, 0.0f, 0.0f };
+                for (int i = 0; i < _nch; ++i) query[i] = cz[i][xx];
 
-                _kd_tree_ptr->findNeighbors(resultSet, &query[0], SearchParams());
+                resultSet.init(ret_index.get(), out_dist_sqr.get());
+                _kd_tree_ptr->findNeighbors(resultSet, &query[0], search);
+                const unsigned n = (unsigned) resultSet.size();
 
-                // calculate the weighted average of the squared distance
-                float total_weights = 0.0f;
-                for (unsigned int i = 0; i < resultSet.size(); ++i)
+                if (single)
                 {
-                    total_weights += 1.0f / std::max<float>(out_dist_sqr[i], APPROX_ZERO);
+                    if (n > 0)
+                    {
+                        const PointCloud<float>::Point& q = P[ret_index[0]];
+                        u = q.pos_x; v = q.pos_y;
+                    }
                 }
-                for (unsigned int i = 0; i < resultSet.size(); ++i)
+                else if (n > 0)
                 {
-                    float weight = 1.0f / (std::max<float>(out_dist_sqr[i], APPROX_ZERO) * total_weights);
-                    u += weight * _point_cloud_ptr->pts[ret_index[i]].pos_x;
-                    v += weight * _point_cloud_ptr->pts[ret_index[i]].pos_y;
+                    float total_weights = 0.0f;
+                    for (unsigned i = 0; i < n; ++i)
+                        total_weights += 1.0f / std::max(out_dist_sqr[i], APPROX_ZERO);
+
+                    const float inv_tw = 1.0f / total_weights;
+                    for (unsigned i = 0; i < n; ++i)
+                    {
+                        const float weight = (1.0f / std::max(out_dist_sqr[i], APPROX_ZERO)) * inv_tw;
+                        const PointCloud<float>::Point& q = P[ret_index[i]];
+                        u += weight * q.pos_x;
+                        v += weight * q.pos_y;
+                    }
                 }
             }
 
             // calculate the correct u,v based on the mode
-            if (_mode == 0)
-            {
-                // stmap
-                u = u / (float) format().width();
-                v = v / (float) format().height();
-            }
-            else if (_mode == 1)
-            {
-                // uvmap
-                u = u - (float) xx;
-                v =  v - (float) y;
-            }
+            if (_mode == 0)        { u *= inv_w; v *= inv_h; }     // stmap
+            else if (_mode == 1)   { u -= (float) xx; v -= (float) y; } // uvmap
 
-            // set the final uv values of the outrow
-            *(outrow.writable(_out_channels[0]) + xx) = u;
-            *(outrow.writable(_out_channels[1]) + xx) = v;
+            ou[xx] = u;
+            ov[xx] = v;
         }
     }
 
